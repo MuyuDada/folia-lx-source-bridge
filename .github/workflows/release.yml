@@ -27,7 +27,7 @@ jobs:
         run: |
           mkdir -p dist
           zip -j "dist/folia-lx-source-bridge-${{ github.event.release.tag_name || 'snapshot' }}.zip" \
-            mod.json index.cjs client.mjs README.md
+            mod.json index.cjs client.mjs README.md preview.png
 
       - name: Upload to release
         if: github.event_name == 'release'

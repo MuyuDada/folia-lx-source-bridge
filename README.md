@@ -91,7 +91,7 @@ node test/proxy.test.mjs
 node test/smoke.test.mjs
 
 # 打可安装的 zip（mod.json 需在 zip 根目录）
-zip -j folia-lx-source-bridge.zip mod.json index.cjs client.mjs README.md
+zip -j folia-lx-source-bridge.zip mod.json index.cjs client.mjs README.md preview.png
 ```
 
 推 tag 即可出 Release，CI 会自动把可安装 zip 附到 Release（见 `.github/workflows/release.yml`）。
