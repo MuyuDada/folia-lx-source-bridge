@@ -320,7 +320,7 @@ export default async function activate(folium) {
                 Object.keys(status.sources).join('、') || '无'
               }）`
             : status.fileMissing
-              ? '还没有脚本：执行「打开 LX 脚本目录」，把脚本放进去命名为 source.js'
+              ? '还没有脚本：执行「打开 LX 脚本目录」，把任意 .js 脚本放进去（最新放入的生效）'
               : '脚本加载失败，详情见模组日志',
         }
       },

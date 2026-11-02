@@ -684,7 +684,6 @@ function statusOf(rt, scriptFile) {
 
 module.exports = function activate(api) {
   const dataDir = api.storage.paths.data
-  const scriptFile = path.join(dataDir, SCRIPT_FILE)
   fs.mkdirSync(dataDir, { recursive: true })
   audioProxy.start(api.log)
 
@@ -692,6 +691,24 @@ module.exports = function activate(api) {
   audioProxy.setPlaceholderHandler(payload => resolveMusicUrl(rt, payload))
   let selfWritingUntil = 0
   let watchTimer = null
+
+  // 目录里可以放任意文件名的 .js 脚本；最新修改的那个生效（换脚本 = 放入/重新保存目标脚本）
+  const listScripts = () =>
+    fs
+      .readdirSync(dataDir)
+      .filter(f => f.toLowerCase().endsWith('.js'))
+      .map(f => {
+        try {
+          return { name: f, mtime: fs.statSync(path.join(dataDir, f)).mtimeMs }
+        } catch {
+          return null
+        }
+      })
+      .filter(Boolean)
+      .sort((a, b) => b.mtime - a.mtime)
+
+  let activeScript = null
+  const scriptPath = () => path.join(dataDir, activeScript ?? SCRIPT_FILE)
 
   const notifyChanged = () => {
     if (api.host.folium.minor >= 7 && typeof api.rpc.send === 'function') {
@@ -701,17 +718,32 @@ module.exports = function activate(api) {
     }
   }
 
-  // 读取有重试：用户往目录里复制/替换文件时，watch 可能在写入完成前触发，读到半个文件
   let reloading = false
   const reloadFromFile = async () => {
     if (reloading) return
     reloading = true
     try {
+      const files = listScripts()
+      if (files.length === 0) {
+        if (activeScript) api.log.info('脚本目录里已没有 .js 文件，沿用当前已加载的脚本')
+        else {
+          api.log.info(
+            `尚未找到音源脚本（${dataDir}）。把任意 .js 脚本放进去（最新放入的生效），或在模组设置里填写脚本下载地址。`,
+          )
+          notifyChanged()
+        }
+        return
+      }
+      const newest = files[0].name
+      if (newest !== activeScript) {
+        api.log.info(`切换音源脚本：${activeScript ?? '(无)'} → ${newest}`)
+        activeScript = newest
+      }
       let code = null
       let readErr = null
       for (let attempt = 1; attempt <= 3; attempt++) {
         try {
-          code = fs.readFileSync(scriptFile, 'utf8')
+          code = fs.readFileSync(scriptPath(), 'utf8')
           break
         } catch (err) {
           readErr = err
@@ -721,9 +753,7 @@ module.exports = function activate(api) {
       }
       if (code == null) {
         if (readErr?.code === 'ENOENT') {
-          api.log.info(
-            `尚未找到音源脚本（${scriptFile}）。把脚本复制到该目录并命名为 source.js，或在模组设置里填写脚本下载地址。`,
-          )
+          api.log.info(`脚本文件刚被移走（${scriptPath()}），目录里最新的 .js 已生效`)
         } else if (readErr) {
           api.log.error('LX 源脚本读取失败', readErr)
         }
@@ -733,7 +763,7 @@ module.exports = function activate(api) {
       try {
         rt.run(code)
         api.log.info(
-          `LX 源脚本已加载：${rt.info.name || '(未命名)'}${rt.info.version ? ` v${rt.info.version}` : ''}`,
+          `LX 源脚本已加载：${rt.info.name || '(未命名)'}${rt.info.version ? ` v${rt.info.version}` : ''}（${activeScript}）`,
         )
       } catch (err) {
         api.log.error('LX 源脚本加载失败', err)
@@ -750,7 +780,7 @@ module.exports = function activate(api) {
   try {
     watcher = fs.watch(dataDir, (_event, filename) => {
       if (Date.now() < selfWritingUntil) return
-      if (filename != null && filename !== SCRIPT_FILE) return
+      if (filename != null && !filename.toLowerCase().endsWith('.js')) return
       clearTimeout(watchTimer)
       watchTimer = setTimeout(() => {
         api.log.info('检测到脚本文件变化，重新加载')
@@ -761,7 +791,7 @@ module.exports = function activate(api) {
     api.log.warn('脚本目录监视不可用（仍可手动执行重载命令）', err)
   }
 
-  api.rpc.handle('lx.status', () => statusOf(rt, scriptFile))
+  api.rpc.handle('lx.status', () => statusOf(rt, scriptPath()))
 
   api.rpc.handle('lx.resolve', ({ source, song, quality } = {}) =>
     resolveMusicUrl(rt, { source, song, quality }),
@@ -776,6 +806,16 @@ module.exports = function activate(api) {
     return true
   })
 
+  // 下载保存时尽量沿用 URL 里的文件名，方便多脚本共存
+  const downloadedName = target => {
+    try {
+      const raw = decodeURIComponent(new URL(target).pathname.split('/').pop() ?? '')
+      const safe = raw.replace(/[\\/:*?"<>|\u0000-\u001f]/g, '').trim()
+      if (safe.toLowerCase().endsWith('.js') && safe.length > 2 && safe.length <= 100) return safe
+    } catch {}
+    return SCRIPT_FILE
+  }
+
   api.rpc.handle('lx.setScriptUrl', ({ url } = {}) => {
     const target = String(url ?? '').trim()
     if (!/^https?:\/\//i.test(target)) throw new Error('需要 http(s) 脚本地址')
@@ -786,12 +826,14 @@ module.exports = function activate(api) {
           return reject(new Error(`下载脚本失败：HTTP ${resp.statusCode}`))
         }
         try {
-          const code = body.toString('utf8')
+          const code = typeof body === 'string' ? body : String(body ?? '')
+          const name = downloadedName(target)
           selfWritingUntil = Date.now() + 1500
-          fs.writeFileSync(scriptFile, code, 'utf8')
+          fs.writeFileSync(path.join(dataDir, name), code, 'utf8')
+          activeScript = name
           rt.run(code)
           notifyChanged()
-          resolve(statusOf(rt, scriptFile))
+          resolve(statusOf(rt, scriptPath()))
         } catch (runErr) {
           reject(runErr)
         }
@@ -802,15 +844,16 @@ module.exports = function activate(api) {
   api.rpc.handle('lx.setScript', ({ code } = {}) => {
     if (typeof code !== 'string' || !code.trim()) throw new Error('脚本文本为空')
     selfWritingUntil = Date.now() + 1500
-    fs.writeFileSync(scriptFile, code, 'utf8')
+    fs.writeFileSync(path.join(dataDir, SCRIPT_FILE), code, 'utf8')
+    activeScript = SCRIPT_FILE
     rt.run(code)
     notifyChanged()
-    return statusOf(rt, scriptFile)
+    return statusOf(rt, scriptPath())
   })
 
-  api.rpc.handle('lx.reload', () => {
-    runFile()
-    return statusOf(rt, scriptFile)
+  api.rpc.handle('lx.reload', async () => {
+    await reloadFromFile()
+    return statusOf(rt, scriptPath())
   })
 
   api.rpc.handle('lx.openScriptDir', () => {
