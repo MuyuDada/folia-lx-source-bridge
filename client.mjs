@@ -321,7 +321,9 @@ export default async function activate(folium) {
               }）`
             : status.fileMissing
               ? '还没有脚本：执行「打开 LX 脚本目录」，把任意 .js 脚本放进去（最新放入的生效）'
-              : '脚本加载失败，详情见模组日志',
+              : status.awaitingInited
+                ? '脚本已运行，但还没等到初始化（inited）——稍等几秒会自动生效；若一直如此，该脚本可能与宿主 API 不兼容，详见模组日志'
+                : '脚本加载失败，详情见模组日志',
         }
       },
     })

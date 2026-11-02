@@ -62,6 +62,21 @@ assert.ok(r1.url.startsWith('https://example.com/wy/186016/320k?sig='))
 await assert.rejects(() => resolveMusicUrl(rt, { source: 'tx', song: { id: 'x' }, quality: 'high' }), /未声明音源 tx/)
 console.log('4. script pipeline OK ->', r1.url)
 
+// 4b. 异步初始化：脚本延迟后才 send(inited)，且 onInited 回调应触发
+const rt2 = createRuntime({ log })
+rt2.run(`const { EVENT_NAMES, on, send } = globalThis.lx
+on(EVENT_NAMES.request, () => Promise.resolve('https://example.com/a.mp3'))
+setTimeout(() => send(EVENT_NAMES.inited, { sources: { wy: { name: 'wy', type: 'music', actions: ['musicUrl'], qualitys: ['128k'] } } }), 80)`)
+assert.strictEqual(rt2.state.loaded, true)
+assert.strictEqual(rt2.state.inited, null, 'inited 未到前应为 null')
+let initedFired = 0
+rt2.setOnInited(() => initedFired++)
+await new Promise(r => setTimeout(r, 250))
+assert.ok(rt2.state.inited, '异步 inited 应被捕获')
+assert.strictEqual(initedFired, 1, 'onInited 回调应触发一次')
+rt2.dispose()
+console.log('4b. async inited OK')
+
 // 5. lx.request 语义：字符串 body + 自动 JSON 解析 + raw Buffer + 不跟随重定向
 const real = await new Promise((resolve, reject) => {
   httpRequest('https://api.github.com/zen', { headers: { 'User-Agent': 'lx-bridge-test' } }, (err, resp, body) =>

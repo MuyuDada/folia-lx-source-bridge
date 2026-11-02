@@ -462,6 +462,13 @@ function createRuntime({ log }) {
   const state = { loaded: false, inited: null, alert: null }
   let info = { name: '', description: '', version: '', author: '', homepage: '', rawScript: '' }
   const pendingCancels = new Set()
+  // 脚本发出 inited 时的回调：异步初始化的脚本会晚于 run() 触发，宿主借此推送状态刷新
+  let onInitedCallback = () => {}
+  const onInited = () => {
+    try {
+      onInitedCallback()
+    } catch {}
+  }
 
   const request = (url, options, callback) => {
     const cancel = httpRequest(url, options, (err, resp, body) => {
@@ -494,11 +501,13 @@ function createRuntime({ log }) {
     },
     send(name, datas) {
       if (name === EVENT_NAMES.inited) {
+        // 有些脚本是异步初始化（先拉配置再发 inited），缺失 sources 只警告不炸
         if (!datas || typeof datas !== 'object' || !datas.sources) {
-          throw new TypeError('inited 事件缺少 sources 字段')
+          log.warn('脚本发送的 inited 缺少 sources 字段，按空音源处理')
         }
-        state.inited = datas
+        state.inited = datas ?? {}
         state.alert = null
+        onInited()
       } else if (name === EVENT_NAMES.updateAlert) {
         state.alert = datas
         log.info(`脚本 updateAlert：${safeText(datas?.log ?? datas)}`)
@@ -592,6 +601,9 @@ function createRuntime({ log }) {
     handlers,
     state,
     log,
+    setOnInited(fn) {
+      onInitedCallback = typeof fn === 'function' ? fn : () => {}
+    },
     get info() {
       return info
     },
@@ -667,6 +679,7 @@ function statusOf(rt, scriptFile) {
   }
   return {
     loaded: Boolean(rt.state.loaded && rt.state.inited),
+    awaitingInited: Boolean(rt.state.loaded && !rt.state.inited),
     fileMissing: !fs.existsSync(scriptFile),
     proxyPort: audioProxy.port(),
     script: {
@@ -689,6 +702,12 @@ module.exports = function activate(api) {
 
   const rt = createRuntime({ log: api.log })
   audioProxy.setPlaceholderHandler(payload => resolveMusicUrl(rt, payload))
+  // 异步初始化的脚本发出 inited 时推送状态（轻抖动），client 才能及时感知
+  let initedNotifyTimer = null
+  rt.setOnInited(() => {
+    clearTimeout(initedNotifyTimer)
+    initedNotifyTimer = setTimeout(notifyChanged, 150)
+  })
   let selfWritingUntil = 0
   let watchTimer = null
 
@@ -851,8 +870,17 @@ module.exports = function activate(api) {
     return statusOf(rt, scriptPath())
   })
 
+  // 有些脚本异步初始化（先拉配置再发 inited）：重载后最多等 3 秒，让命令能拿到最终状态
+  const waitForInited = async (ms = 3000) => {
+    const deadline = Date.now() + ms
+    while (!rt.state.inited && Date.now() < deadline) {
+      await new Promise(resolve => setTimeout(resolve, 100))
+    }
+  }
+
   api.rpc.handle('lx.reload', async () => {
     await reloadFromFile()
+    await waitForInited()
     return statusOf(rt, scriptPath())
   })
 
