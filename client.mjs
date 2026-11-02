@@ -89,10 +89,14 @@ export default async function activate(folium) {
   // ---------------------------------------------------------------- 状态
   let status = null
   const refreshStatus = async () => {
+    const prevLoaded = status?.loaded
     try {
       status = await rpc.call('lx.status')
     } catch (err) {
       log.error('读取 LX 桥状态失败', err)
+    }
+    if (prevLoaded && status && !status.loaded) {
+      ui.toast('LX 源脚本加载失败，已暂停接管（详情见模组日志）', { type: 'error' })
     }
     registerProvider()
     return status
@@ -156,10 +160,24 @@ export default async function activate(folium) {
 
   // ---------------------------------------------------------------- 接法 2：独立音源
   let providerHandle = null
+  let providerSignature = ''
   const searchStates = new Map() // query → { cursor, nextOffset }：omni 游标分页 → 偏移分页的适配
 
+  const unregisterProvider = () => {
+    if (!providerHandle) return
+    try {
+      providerHandle.unregister()
+    } catch {}
+    providerHandle = null
+    providerSignature = ''
+  }
+
   const registerProvider = () => {
-    if (providerHandle || !values.providerMode || !status?.loaded) return
+    // 脚本未加载（或被切换失败）时注册的音源什么都干不了，先撤下，等恢复再注册
+    if (!values.providerMode || !status?.loaded) {
+      unregisterProvider()
+      return
+    }
     const def = experimental?.['omni.providers']
     if (!def || typeof def.register !== 'function') {
       log.warn('宿主未提供 omni.providers 接口，独立音源不可用')
@@ -179,6 +197,16 @@ export default async function activate(folium) {
         }
       }
     } catch {}
+
+    // 换脚本后（名称/版本/支持的平台/代理平台变化）必须重新注册，否则旧的注册信息会一直不匹配
+    const signature = [
+      status.script.name,
+      status.script.version,
+      Object.keys(status.sources).sort().join(','),
+      proxy?.info.providerId ?? 'none',
+    ].join('|')
+    if (providerHandle && providerSignature === signature) return
+    unregisterProvider()
 
     try {
       providerHandle = def.register({
@@ -265,20 +293,17 @@ export default async function activate(folium) {
         getLyrics: async () => null,
       })
       log.info(`已注册独立音源：folium.lx-source-bridge.lx${proxy ? `（搜索代理：${proxy.info.providerId}）` : '（无搜索代理）'} `)
+      providerSignature = signature
     } catch (err) {
       providerHandle = null
+      providerSignature = ''
       log.error('注册独立音源失败（钩子模式不受影响）', err)
     }
   }
 
   const syncProviderMode = () => {
     if (values.providerMode) registerProvider()
-    else if (providerHandle) {
-      try {
-        providerHandle.unregister()
-      } catch {}
-      providerHandle = null
-    }
+    else unregisterProvider()
   }
 
   // ---------------------------------------------------------------- 命令
@@ -335,9 +360,7 @@ export default async function activate(folium) {
 
   return () => {
     hookDisposer?.()
-    try {
-      providerHandle?.unregister()
-    } catch {}
+    unregisterProvider()
     settingsUnsubscribe?.()
   }
 }

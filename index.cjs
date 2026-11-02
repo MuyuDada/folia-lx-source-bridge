@@ -701,26 +701,50 @@ module.exports = function activate(api) {
     }
   }
 
-  const runFile = () => {
-    if (!fs.existsSync(scriptFile)) {
-      api.log.info(
-        `尚未找到音源脚本（${scriptFile}）。把脚本复制到该目录并命名为 source.js，或在模组设置里填写脚本下载地址。`,
-      )
-      return
-    }
+  // 读取有重试：用户往目录里复制/替换文件时，watch 可能在写入完成前触发，读到半个文件
+  let reloading = false
+  const reloadFromFile = async () => {
+    if (reloading) return
+    reloading = true
     try {
-      rt.run(fs.readFileSync(scriptFile, 'utf8'))
-      api.log.info(
-        `LX 源脚本已加载：${rt.info.name || '(未命名)'}${rt.info.version ? ` v${rt.info.version}` : ''}`,
-      )
+      let code = null
+      let readErr = null
+      for (let attempt = 1; attempt <= 3; attempt++) {
+        try {
+          code = fs.readFileSync(scriptFile, 'utf8')
+          break
+        } catch (err) {
+          readErr = err
+          if (attempt >= 3 || !['EBUSY', 'ENOENT', 'EPERM'].includes(err.code)) break
+          await new Promise(resolve => setTimeout(resolve, 350))
+        }
+      }
+      if (code == null) {
+        if (readErr?.code === 'ENOENT') {
+          api.log.info(
+            `尚未找到音源脚本（${scriptFile}）。把脚本复制到该目录并命名为 source.js，或在模组设置里填写脚本下载地址。`,
+          )
+        } else if (readErr) {
+          api.log.error('LX 源脚本读取失败', readErr)
+        }
+        notifyChanged()
+        return
+      }
+      try {
+        rt.run(code)
+        api.log.info(
+          `LX 源脚本已加载：${rt.info.name || '(未命名)'}${rt.info.version ? ` v${rt.info.version}` : ''}`,
+        )
+      } catch (err) {
+        api.log.error('LX 源脚本加载失败', err)
+      }
       notifyChanged()
-    } catch (err) {
-      api.log.error('LX 源脚本加载失败', err)
-      notifyChanged()
+    } finally {
+      reloading = false
     }
   }
 
-  runFile()
+  void reloadFromFile()
 
   let watcher = null
   try {
@@ -730,7 +754,7 @@ module.exports = function activate(api) {
       clearTimeout(watchTimer)
       watchTimer = setTimeout(() => {
         api.log.info('检测到脚本文件变化，重新加载')
-        runFile()
+        void reloadFromFile()
       }, 400)
     })
   } catch (err) {
