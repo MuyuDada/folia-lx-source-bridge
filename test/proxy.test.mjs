@@ -87,7 +87,7 @@ let handlerCalls = 0
 audioProxy.setPlaceholderHandler(async payload => {
   handlerCalls++
   await new Promise(r => setTimeout(r, 80))
-  if (payload.song.id === 'fail') throw new Error('all chains dead')
+  if (payload.song.id === 'fail' || payload.song.id === 'fail-fb') throw new Error('all chains dead')
   return { url: targetUrl, quality: '320k' }
 })
 const mkPlaceholder = id =>
@@ -110,6 +110,28 @@ const pf = await fetch(mkPlaceholder('fail'), { redirect: 'manual' })
 assert.strictEqual(pf.status, 502)
 assert.strictEqual((await fetch(mkPlaceholder('fail'), { redirect: 'manual' })).status, 502)
 console.log('6. placeholder flow OK (302 + dedup + 502)')
+
+// 7. 带兜底的占位地址：脚本失败 → 302 到宿主原地址（云盘歌曲场景），且兜底结果缓存
+const mkPlaceholderWithFallback = id =>
+  `http://127.0.0.1:${audioProxy.port()}/p/${b64url(
+    JSON.stringify({
+      source: 'wy',
+      quality: '320k',
+      song: { id, title: 't', artist: 'a', album: '' },
+      fallback: 'https://fallback.example.org/orig.mp3',
+    }),
+  )}`
+handlerCalls = 0
+const fb1 = await fetch(mkPlaceholderWithFallback('fail-fb'), { redirect: 'manual' })
+assert.strictEqual(fb1.status, 302, '脚本失败应回退宿主地址而非 502')
+assert.strictEqual(fb1.headers.get('location'), 'https://fallback.example.org/orig.mp3')
+const fb2 = await fetch(mkPlaceholderWithFallback('fail-fb'), { redirect: 'manual' })
+assert.strictEqual(fb2.status, 302)
+assert.strictEqual(fb2.headers.get('location'), 'https://fallback.example.org/orig.mp3')
+assert.strictEqual(handlerCalls, 1, '兜底结果应被缓存（handler 只跑一次）')
+// 无兜底时仍应 502
+assert.strictEqual((await fetch(mkPlaceholder('fail'), { redirect: 'manual' })).status, 502)
+console.log('7. fallback flow OK (302 to original URL + cached)')
 
 audioProxy.close()
 rt.dispose()

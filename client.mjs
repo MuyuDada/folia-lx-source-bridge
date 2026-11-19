@@ -122,25 +122,56 @@ export default async function activate(folium) {
     for (const b of bytes) bin += String.fromCharCode(b)
     return btoa(bin).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '')
   }
-  const placeholderUrl = (lxSource, song, quality) => {
+  const placeholderUrl = (lxSource, song, quality, fallback) => {
     if (!status?.loaded || !status.proxyPort) return null
     const payload = toBase64Url(
       JSON.stringify({
         source: lxSource,
         quality: quality || values.quality || 'high',
         song: { id: String(song.id), title: song.title ?? '', artist: song.artist ?? '', album: song.album ?? '' },
+        // 宿主原本解析出的地址：脚本解析不了（云盘等私有内容）时由 main 侧 302 兜底
+        fallback: fallback ?? null,
       }),
     )
     return `http://127.0.0.1:${status.proxyPort}/p/${payload}`
   }
-  const prefetch = (lxSource, song, quality) => {
+  const prefetch = (lxSource, song, quality, fallback) => {
     void rpc
       .call('lx.prefetch', {
         source: lxSource,
         song: { id: song.id, title: song.title ?? '', artist: song.artist ?? '', album: song.album ?? '' },
         quality: quality || values.quality || 'high',
+        fallback: fallback ?? null,
       })
       .catch(() => {})
+  }
+
+  // 云盘/私有歌曲检测：这类歌只有用户本人能播，公共脚本解析不了。
+  // omni.resolveSongs 对「只存在于云盘」的歌会回 not-found（源明确说没有这首歌）；
+  // failed/unsupported 说明问不出结果，按普通歌处理。结论按歌缓存：
+  // 已判定私有的歌，钩子直接不接管（宿主原地址即时播放）；未判定的本次仍接管，
+  // 但占位地址里带了兜底地址，脚本解析失败会自动回退，下一次播放就能走对的路。
+  const privateSongs = new Map()
+  const cloudChecks = new Map()
+  const markCloudIfNeeded = song => {
+    const key = `${song.source}:${song.id}`
+    if (song.source !== 'netease' || privateSongs.has(key) || cloudChecks.has(key)) return
+    const check = (async () => {
+      try {
+        const [res] = await omni.resolveSongs([{ source: 'netease', id: song.id }])
+        return res?.status === 'not-found'
+      } catch {
+        return false
+      }
+    })()
+    cloudChecks.set(key, check)
+    check
+      .then(isPrivate => {
+        privateSongs.set(key, isPrivate)
+        if (isPrivate) log.info(`云盘/私有歌曲 ${song.id}：不再由脚本接管`)
+      })
+      .catch(() => {})
+      .finally(() => cloudChecks.delete(key))
   }
 
   // ---------------------------------------------------------------- 接法 1：钩子（纯同步，绝不超时）
@@ -150,9 +181,12 @@ export default async function activate(folium) {
       if (!values.enabled || !ev.song || ev.song.source == null || ev.song.id == null) return
       const lxSource = HOOK_SOURCE_MAP[ev.song.source]
       if (!lxSource || !supportsMusicUrl(lxSource)) return
-      const placeholder = placeholderUrl(lxSource, ev.song, values.quality)
+      // 已判定为云盘/私有的歌：脚本解析不了，保持宿主原地址即时播放
+      if (privateSongs.get(`${ev.song.source}:${ev.song.id}`) === true) return
+      const placeholder = placeholderUrl(lxSource, ev.song, values.quality, ev.url)
       if (placeholder) ev.url = placeholder
-      prefetch(lxSource, ev.song, values.quality)
+      prefetch(lxSource, ev.song, values.quality, ev.url)
+      markCloudIfNeeded(ev.song)
     })
   } catch (err) {
     log.error('omni.audioSourceResolved 钩子不可用（钩子模式关闭，独立音源不受影响）', err)

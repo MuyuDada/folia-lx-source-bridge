@@ -257,11 +257,13 @@ const audioProxy = (() => {
   // 占位地址的解析缓存：key = source|songId|quality，值是共享的解析 Promise（去重 + 10 分钟 TTL）
   const resolveCache = new Map()
   const RESOLVE_TTL_MS = 10 * 60_000
+  // 兜底地址（宿主原本解析出的）缓存得短一些：脚本链路恢复后应尽快切回脚本地址
+  const FALLBACK_TTL_MS = 5 * 60_000
 
   const sweepResolve = () => {
     const now = Date.now()
     for (const [key, entry] of resolveCache) {
-      if (now - entry.at > RESOLVE_TTL_MS) resolveCache.delete(key)
+      if (now - entry.at > (entry.ttl ?? RESOLVE_TTL_MS)) resolveCache.delete(key)
     }
   }
 
@@ -271,11 +273,23 @@ const audioProxy = (() => {
     if (!entry) {
       entry = {
         at: Date.now(),
-        promise: (async () => (await placeholderHandler(payload)).url)(),
+        // 脚本解析失败时回退到宿主原本解析出的地址（云盘等私有内容脚本拿不到，不回退就没法播）
+        promise: Promise.resolve(placeholderHandler(payload))
+          .then(r => ({ url: r.url, fromScript: true }))
+          .catch(err => {
+            const fb = payload.fallback
+            if (fb && /^https?:\/\//i.test(fb)) return { url: fb, fromScript: false }
+            throw err
+          }),
       }
-      entry.promise.catch(() => {
-        if (resolveCache.get(key) === entry) resolveCache.delete(key)
-      })
+      entry.promise.then(
+        r => {
+          if (!r.fromScript) entry.ttl = FALLBACK_TTL_MS
+        },
+        () => {
+          if (resolveCache.get(key) === entry) resolveCache.delete(key)
+        },
+      )
       resolveCache.set(key, entry)
     }
     return entry.promise
@@ -293,8 +307,8 @@ const audioProxy = (() => {
     }
     const key = `${payload.source}|${payload.song.id}|${payload.quality ?? ''}`
     getOrCreateResolve(key, payload).then(
-      url => {
-        clientRes.writeHead(302, { Location: url })
+      r => {
+        clientRes.writeHead(302, { Location: r.url })
         clientRes.end()
       },
       err => {
